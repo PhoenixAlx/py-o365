@@ -236,10 +236,11 @@ class Attachments(ApiComponent):
         self.__attachments = []
         if getattr(self._parent, 'has_attachments', None) is not None:
             setattr(self._parent, 'has_attachments', False)
+        self._track_changes()
 
     def _track_changes(self):
         """ Update the track_changes on the parent to reflect a needed update on this field """
-        if getattr(self._parent, '_track_changes', None):
+        if getattr(self._parent, '_track_changes', None) is not None:
             self._parent._track_changes.add('attachments')
 
     def _update_parent_attachments(self):

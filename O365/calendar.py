@@ -6,7 +6,8 @@ import pytz
 import calendar
 from bs4 import BeautifulSoup as bs
 
-from O365.utils import Pagination, NEXT_LINK_KEYWORD, ApiComponent, Attachments, Attachment, AttachableMixin, ImportanceLevel
+from O365.utils import Pagination, NEXT_LINK_KEYWORD, ApiComponent, Attachments, Attachment, \
+    AttachableMixin, ImportanceLevel, TrackerSet
 from O365.message import HandleRecipientsMixin
 
 log = logging.getLogger(__name__)
@@ -370,9 +371,10 @@ class ResponseStatus(ApiComponent):
 class Attendee:
     """ A Event attendee """
 
-    def __init__(self, address, *, name=None, attendee_type=None, response_status=None):
-        self.address = address
-        self.name = name
+    def __init__(self, address, *, name=None, attendee_type=None, response_status=None, event=None):
+        self._address = address
+        self._name = name
+        self._event = event
         if isinstance(response_status, ResponseStatus):
             self.__response_status = response_status
         else:
@@ -391,6 +393,29 @@ class Attendee:
         return self.__str__()
 
     @property
+    def address(self):
+        return self._address
+
+    @address.setter
+    def address(self, value):
+        self._address = value
+        self._name = ''
+        self._track_changes()
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+        self._track_changes()
+
+    def _track_changes(self):
+        """ Update the track_changes on the event to reflect a needed update on this field """
+        self._event._track_changes.add('attendees')
+
+    @property
     def response_status(self):
         return self.__response_status
 
@@ -404,6 +429,7 @@ class Attendee:
             self.__attendee_type = value
         else:
             self.__attendee_type = AttendeeType(value)
+        self._track_changes()
 
 
 class Attendees(ApiComponent):
@@ -447,7 +473,7 @@ class Attendees(ApiComponent):
 
         if attendees:
             if isinstance(attendees, str):
-                self.__attendees.append(Attendee(address=attendees))
+                self.__attendees.append(Attendee(address=attendees, event=self._event))
                 self._track_changes()
             elif isinstance(attendees, Attendee):
                 self.__attendees.append(attendees)
@@ -455,7 +481,7 @@ class Attendees(ApiComponent):
             elif isinstance(attendees, tuple):
                 name, address = attendees
                 if address:
-                    self.__attendees.append(Attendee(address=address, name=name))
+                    self.__attendees.append(Attendee(address=address, name=name, event=self._event))
                     self._track_changes()
             elif isinstance(attendees, list):
                 for attendee in attendees:
@@ -469,7 +495,7 @@ class Attendees(ApiComponent):
                         name = email.get(self._cc('name'), None)
                         attendee_type = attendee.get(self._cc('type'), 'required')  # default value
                         self.__attendees.append(
-                            Attendee(address=address, name=name, attendee_type=attendee_type,
+                            Attendee(address=address, name=name, attendee_type=attendee_type, event=self._event,
                                      response_status=ResponseStatus(parent=self,
                                                                     response_status=attendee.get(self._cc('status'), {}))))
             else:
@@ -527,12 +553,12 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         main_resource = kwargs.pop('main_resource', None) or getattr(parent, 'main_resource', None) if parent else None
         super().__init__(protocol=parent.protocol if parent else kwargs.get('protocol'), main_resource=main_resource)
 
-        self._track_changes = set()  # internal to know which properties need to be updated on the server
+        cc = self._cc  # alias
+        self._track_changes = TrackerSet(casing=cc)  # internal to know which properties need to be updated on the server
         self.calendar_id = kwargs.get('calendar_id', None)
         download_attachments = kwargs.get('download_attachments')
         cloud_data = kwargs.get(self._cloud_data_key, {})
 
-        cc = self._cc  # alias
         self.object_id = cloud_data.get(cc('id'), None)
         self.__subject = cloud_data.get(cc('subject'), kwargs.get('subject', '') or '')
         body = cloud_data.get(cc('body'), {})
@@ -542,12 +568,12 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.__attendees = Attendees(event=self, attendees={self._cloud_data_key: cloud_data.get(cc('attendees'), [])})
         self.__categories = cloud_data.get(cc('categories'), [])
 
-        self.created = cloud_data.get(cc('createdDateTime'), None)
-        self.modified = cloud_data.get(cc('lastModifiedDateTime'), None)
+        self.__created = cloud_data.get(cc('createdDateTime'), None)
+        self.__modified = cloud_data.get(cc('lastModifiedDateTime'), None)
 
         local_tz = self.protocol.timezone
-        self.created = parse(self.created).astimezone(local_tz) if self.created else None
-        self.modified = parse(self.modified).astimezone(local_tz) if self.modified else None
+        self.__created = parse(self.__created).astimezone(local_tz) if self.__created else None
+        self.__modified = parse(self.__modified).astimezone(local_tz) if self.__modified else None
 
         start_obj = cloud_data.get(cc('start'), {})
         if isinstance(start_obj, dict):
@@ -592,9 +618,9 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.__location = cloud_data.get(cc('location'), {}).get(cc('displayName'), '')
         self.locations = cloud_data.get(cc('locations'), [])  # TODO
         self.online_meeting_url = cloud_data.get(cc('onlineMeetingUrl'), None)
-        self.__organizer = self._recipient_from_cloud(cloud_data.get(cc('organizer'), None))
+        self.__organizer = self._recipient_from_cloud(cloud_data.get(cc('organizer'), None), field='organizer')
         self.__recurrence = EventRecurrence(event=self, recurrence=cloud_data.get(cc('recurrence'), None))
-        self.__is_reminder_on = cloud_data.get(cc('isReminderOn'), None)
+        self.__is_reminder_on = cloud_data.get(cc('isReminderOn'), True)
         self.__remind_before_minutes = cloud_data.get(cc('reminderMinutesBeforeStart'), 15)
         self.__response_requested = cloud_data.get(cc('responseRequested'), True)
         self.__response_status = ResponseStatus(parent=self, response_status=cloud_data.get(cc('responseStatus'), {}))
@@ -651,6 +677,14 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
                 if key not in restrict_keys:
                     del data[key]
         return data
+
+    @property
+    def created(self):
+        return self.__created
+
+    @property
+    def modified(self):
+        return self.__modified
 
     @property
     def body(self):
@@ -865,12 +899,9 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         if self.object_id:
             # update event
             if not self._track_changes:
-                return False  # there's nothing to update
+                return True  # there's nothing to update
             url = self.build_url(self._endpoints.get('event').format(id=self.object_id))
             method = self.con.patch
-            if not self._track_changes:
-                # no changes to save...
-                return True
             data = self.to_api_data(restrict_keys=self._track_changes)
         else:
             # new event
@@ -897,13 +928,14 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
             event = response.json()
 
             self.object_id = event.get(self._cc('id'), None)
-            self.created = event.get(self._cc('createdDateTime'), None)
-            self.modified = event.get(self._cc('lastModifiedDateTime'), None)
 
-            self.created = parse(self.created).astimezone(self.protocol.timezone) if self.created else None
-            self.modified = parse(self.modified).astimezone(self.protocol.timezone) if self.modified else None
+            self.__created = event.get(self._cc('createdDateTime'), None)
+            self.__modified = event.get(self._cc('lastModifiedDateTime'), None)
+
+            self.__created = parse(self.__created).astimezone(self.protocol.timezone) if self.__created else None
+            self.__modified = parse(self.__modified).astimezone(self.protocol.timezone) if self.__modified else None
         else:
-            self.modified = self.protocol.timezone.localize(dt.datetime.now())
+            self.__modified = self.protocol.timezone.localize(dt.datetime.now())
 
         return True
 
@@ -1001,7 +1033,7 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
 
         self.name = cloud_data.get(self._cc('name'), '')
         self.calendar_id = cloud_data.get(self._cc('id'), None)
-        self.__owner = self._recipient_from_cloud(cloud_data.get(self._cc('owner'), {}))
+        self.__owner = self._recipient_from_cloud(cloud_data.get(self._cc('owner'), {}), field='owner')
         color = cloud_data.get(self._cc('color'), -1)
         if isinstance(color, str):
             color = -1 if color == 'auto' else color
